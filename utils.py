@@ -2,6 +2,21 @@ from osgeo import gdal
 import os
 import rasterio
 import ee
+
+import zipfile
+import os
+import rasterio
+from rasterio.mask import mask
+from rasterio.warp import calculate_default_transform, reproject, Resampling
+import numpy as np
+from collections import defaultdict
+import geopandas as gpd
+from lxml import etree
+from shapely.geometry import Point, LineString, Polygon
+import pandas as pd
+import tempfile
+
+
 def get_image_dimension(image):
     dataset = gdal.Open(image)
     rows = dataset.RasterXSize
@@ -220,3 +235,241 @@ def applyKMeans(image, num_clusters=7):
     kmeans_clusters = image.cluster(clusterer).rename('KMeans_clusters')
 
     return image.addBands(kmeans_clusters)
+
+
+
+
+
+
+
+
+
+# Input paths
+
+def extract_kml_from_kmz(kmz_path, output_dir='temp_kml'):
+    """Extract KML file from KMZ archive."""
+    if not os.path.exists(kmz_path):
+        raise FileNotFoundError(f"KMZ file not found: {kmz_path}")
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    try:
+        with zipfile.ZipFile(kmz_path, 'r') as kmz:
+            kml_file = [f for f in kmz.namelist() if f.endswith('.kml')][0]
+            kmz.extract(kml_file, output_dir)
+            return os.path.join(output_dir, kml_file)
+    except Exception as e:
+        print(f"Error extracting KMZ: {e}")
+        return None
+
+def parse_site_geometry(kml_path, site_name):
+    """Parse KML file and extract geometry for Adhapalli."""
+    namespaces = {'kml': 'http://www.opengis.net/kml/2.2'}
+    try:
+        tree = etree.parse(kml_path)
+        root = tree.getroot()
+        placemarks = root.findall('.//kml:Placemark', namespaces)
+
+        for placemark in placemarks:
+            name = placemark.find('kml:name', namespaces)
+            if name is not None and site_name in name.text:
+                for geom_type in ['Point', 'LineString', 'Polygon']:
+                    geometry = placemark.find(f'.//kml:{geom_type}', namespaces)
+                    if geometry is not None:
+                        coords = geometry.find('kml:coordinates', namespaces)
+                        if coords is not None:
+                            coord_list = []
+                            for coord in coords.text.strip().split():
+                                lon, lat, *alt = map(float, coord.split(','))
+                                coord_list.append((lon, lat))
+
+                            # Create geometry based on type
+                            if geom_type == 'Point':
+                                return Point(coord_list[0])
+                            elif geom_type == 'LineString':
+                                return LineString(coord_list)
+                            else:  # Polygon
+                                return Polygon(coord_list)
+        print("No " + site_name + " geometry found in KML")
+        return None
+    except Exception as e:
+        print(f"Error parsing KML: {e}")
+        return None
+
+def reproject_raster(src_path, dst_path, dst_crs):
+    """Reproject a raster to a specified CRS."""
+    with rasterio.open(src_path) as src:
+        transform, width, height = calculate_default_transform(
+            src.crs, dst_crs, src.width, src.height, *src.bounds)
+        kwargs = src.meta.copy()
+        kwargs.update({
+            'crs': dst_crs,
+            'transform': transform,
+            'width': width,
+            'height': height
+        })
+
+        with rasterio.open(dst_path, 'w', **kwargs) as dst:
+            for i in range(1, src.count + 1):
+                reproject(
+                    source=rasterio.band(src, i),
+                    destination=rasterio.band(dst, i),
+                    src_transform=src.transform,
+                    src_crs=src.crs,
+                    dst_transform=transform,
+                    dst_crs=dst_crs,
+                    resampling=Resampling.nearest)
+
+def match_resolution_and_extent(def_path, cluster_shape, cluster_transform, cluster_crs):
+    """Resample the deforestation raster to match the cluster raster's shape, transform, and CRS."""
+    with rasterio.open(def_path) as def_src:
+        def_data = np.empty(cluster_shape, dtype=def_src.meta['dtype'])
+
+        reproject(
+            source=rasterio.band(def_src, 1),
+            destination=def_data,
+            src_transform=def_src.transform,
+            src_crs=def_src.crs,
+            dst_transform=cluster_transform,
+            dst_crs=cluster_crs,
+            resampling=Resampling.nearest
+        )
+        return def_data, def_src.nodata
+
+def calculate_deforestation_by_cluster(clusters_tif_path, deforestation_tif_path, kmz_path, output_pth):
+    """Calculate deforestation within each cluster and save to CSV."""
+    # Initialize temp_defor_path to avoid undefined variable errors
+    temp_defor_path = None
+
+    try:
+        # Validate input files
+        # print(deforestation_tif_path)
+        for path in [clusters_tif_path, deforestation_tif_path, kmz_path]:
+            if not os.path.exists(path):
+                # raise FileNotFoundError(f"File not found: {path}")
+                print(path)
+        # Extract KML and get Adhapalli geometry
+        kml_path = extract_kml_from_kmz(kmz_path)
+        if not kml_path:
+            return
+
+        geometry = parse_site_geometry(kml_path)
+        if geometry is None:
+            return
+
+        # Clean up temporary KML
+        try:
+            os.remove(kml_path)
+            os.rmdir(os.path.dirname(kml_path))
+        except:
+            pass
+
+        # Create GeoDataFrame with the geometry
+        gdf = gpd.GeoDataFrame(geometry=[geometry], crs='EPSG:4326')
+
+        # Load the clusters raster
+        with rasterio.open(clusters_tif_path) as cluster_src:
+            cluster_crs = cluster_src.crs
+            cluster_nodata = cluster_src.nodata if cluster_src.nodata is not None else -9999
+            cluster_bounds = cluster_src.bounds
+            cluster_shape = cluster_src.shape
+            cluster_transform = cluster_src.transform
+            cluster_pixel_size = (cluster_transform[0], -cluster_transform[4])
+            print("Cluster pixel size:", cluster_pixel_size)
+
+        # Reproject geometry to cluster CRS
+        if cluster_crs and cluster_crs != 'EPSG:4326':
+            gdf = gdf.to_crs(cluster_crs)
+
+        # Check if geometry intersects with cluster raster bounds
+        geom_bounds = gdf.geometry.iloc[0].bounds
+        if not (geom_bounds[0] <= cluster_bounds.right and
+                geom_bounds[2] >= cluster_bounds.left and
+                geom_bounds[1] <= cluster_bounds.top and
+                geom_bounds[3] >= cluster_bounds.bottom):
+            print("Error: Geometry does not overlap with cluster raster extent")
+            return
+
+        # Load deforestation raster metadata
+        with rasterio.open(deforestation_tif_path) as def_src:
+            def_crs = def_src.crs
+            def_transform = def_src.transform
+            def_pixel_size = (def_transform[0], -def_transform[4])
+            print("Deforestation pixel size:", def_pixel_size)
+
+        # Resolution check (updated to allow 25m)
+        if not (abs(cluster_pixel_size[0] - 25) < 0.1 and abs(cluster_pixel_size[1] - 25) < 0.1):
+            print(f"Warning: K-means clusters raster does not have 25m resolution, found {cluster_pixel_size}")
+        if not (abs(def_pixel_size[0] - 25) < 0.1 and abs(def_pixel_size[1] - 25) < 0.1):
+            print(f"Warning: Deforestation raster does not have 25m resolution, found {def_pixel_size}")
+
+        # CRS check and reprojection if needed
+        if cluster_crs != def_crs:
+            # print(f"Warning: CRS mismatch. Clusters: {cluster_crs}, Deforestation: {def_crs}. Reprojecting deforestation raster.")
+            with tempfile.NamedTemporaryFile(suffix='.tif', delete=False) as tmp:
+                temp_defor_path = tmp.name
+            reproject_raster(deforestation_tif_path, temp_defor_path, cluster_crs)
+            print(deforestation_tif_path)
+            deforestation_tif_path = temp_defor_path  # Use reprojected path
+            print(deforestation_tif_path)
+
+        # Mask cluster raster with geometry
+        geom = [gdf.geometry.iloc[0].__geo_interface__]
+        with rasterio.open(clusters_tif_path) as cluster_src:
+            masked_clusters, masked_transform = mask(
+                cluster_src, geom, crop=True, nodata=cluster_nodata
+            )
+            masked_clusters = masked_clusters[0]
+
+        # Resample deforestation to match masked clusters
+        deforestation_subset, def_nodata = match_resolution_and_extent(
+            deforestation_tif_path, masked_clusters.shape, masked_transform, cluster_crs
+        )
+
+        # Calculate total deforestation per cluster
+        cluster_deforestation = defaultdict(float)
+        unique_clusters = np.unique(masked_clusters[~np.isclose(masked_clusters, cluster_nodata)])
+        # print(f"Unique clusters found in masked area: {unique_clusters.tolist()}")
+
+        for cluster_id in unique_clusters:
+            cluster_mask = masked_clusters == cluster_id  # Changed variable name from 'mask' to 'cluster_mask'
+            if def_nodata is not None:
+                valid_deforestation = np.where(deforestation_subset != def_nodata, deforestation_subset, 0)
+            else:
+                valid_deforestation = deforestation_subset
+            total_deforestation = np.sum(valid_deforestation[cluster_mask])  # Changed to use 'cluster_mask'
+            cluster_deforestation[int(cluster_id)] = total_deforestation
+            # print(f"Cluster {cluster_id}: Deforestation = {total_deforestation:.2f} ha/year, Pixels = {np.sum(cluster_mask)}")  # Changed to use 'cluster_mask'
+
+        # Ensure clusters 3 and 4 are included, even if they have zero deforestation
+        expected_clusters = set(cluster_deforestation.keys()).union({3, 4})
+        results = []
+        for cluster_id in sorted(expected_clusters):
+            total = cluster_deforestation.get(cluster_id, 0.0)
+            results.append({
+                'cluster_id': int(cluster_id),
+                'total_deforestation': float(total)
+            })
+            if cluster_id not in cluster_deforestation:
+                # print(f"Cluster {cluster_id}: Deforestation = 0.00 ha/year, Pixels = 0")
+                pass
+
+        # Save to CSV
+        df = pd.DataFrame(results)
+        output_csv = output_pth
+        df.to_csv(output_csv, index=False)
+        print(f"Results saved to '{output_csv}'")
+
+    except FileNotFoundError as e:
+        print(f"Error: One or more files not found. Check paths: {clusters_tif_path}, {deforestation_tif_path}, {kmz_path}")
+    except Exception as e:
+        print(f"Error during analysis: {str(e)}")
+    finally:
+        # Clean up temporary file if it exists
+        if temp_defor_path and os.path.exists(temp_defor_path):
+            try:
+                os.remove(temp_defor_path)
+            except:
+                pass
+
+def is_within_bounds(x, y, bounds):
+    return bounds.left <= x <= bounds.right and bounds.bottom <= y <= bounds.top
